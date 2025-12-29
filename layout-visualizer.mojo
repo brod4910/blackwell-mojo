@@ -10,8 +10,7 @@ from gpu.host.nvidia.tma import TensorMapSwizzle
 from gpu import block_idx, lane_id, thread_idx
 from gpu.memory import external_memory, fence_async_view_proxy
 from gpu.mma import st_matrix
-from gpu.compute.mma_sm100 import *
-from gpu.compute.tcgen05 import *
+from gpu.tcgen05 import *
 
 # Additional imports for testing
 from layout import (
@@ -38,6 +37,8 @@ from utils.numerics import get_accum_type
 from utils.static_tuple import StaticTuple
 
 
+@__llvm_metadata(`nvvm.cluster_dim`=(1, 1, 1))
+@__llvm_arg_metadata(a_tma_tile, `nvvm.grid_constant`)
 fn visualize_tma[
     dtype: DType,
     a_layout: Layout,
@@ -55,15 +56,25 @@ fn visualize_tma[
     ]()
     comptime a_size = a_smem_layout.size()
     comptime a_expected_bytes = a_size * size_of[dtype]()
-    
-    smem_a = LayoutTensor[
+
+    comptime a_smem_size = BM * BK
+
+    var start_smem = external_memory[
+            Scalar[dtype],
+            address_space = AddressSpace.SHARED,
+            alignment=128,
+            name="tmem_dynamic_shared_memory",
+        ]()
+
+    var smem_a = LayoutTensor[
         dtype,
         Layout.row_major(BM, BK),
         MutAnyOrigin,
         address_space = AddressSpace.SHARED,
-        alignment=128
-    ].stack_allocation()
+        alignment=128,
+    ](start_smem)
 
+    var tma_mbar = (smem_a.ptr + a_smem_size).bitcast[SharedMemBarrier]()
 
 def main():
     comptime M = 256
@@ -92,9 +103,9 @@ def main():
     comptime a_layout = Layout.row_major(M, K)
     var a_tensor = LayoutTensor[dtype, a_layout](a_d)
 
-    var a_tma_tile = create_tma_tile[
-        Index(BM, BK), swizzle_mode = a_swizzle
-    ](ctx, a_tensor)
+    var a_tma_tile = create_tma_tile[Index(BM, BK), swizzle_mode=a_swizzle](
+        ctx, a_tensor
+    )
 
     comptime kernel = visualize_tma[
         dtype,
@@ -108,3 +119,15 @@ def main():
         BN,
         BK,
     ]
+
+    comptime smem_use = (
+        BM * size_of[dtype]()
+    ) * BK + 24
+
+    ctx.enqueue_function_checked[kernel, kernel](
+        a_tma_tile,
+        grid_dim=(ceildiv(N, BN), ceildiv(M, BM)),
+        block_dim=(1,),
+        shared_mem_bytes=Int(smem_use),
+        func_attribute=FuncAttribute.MAX_DYNAMIC_SHARED_SIZE_BYTES(smem_use),
+    )
